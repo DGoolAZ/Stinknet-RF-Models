@@ -22,7 +22,7 @@ library(igraph)
 library(ggraph)
 
 # Define a function to impute NA values with the mean for a raster layer
-impute_na_with_mean <- function(r) {1
+impute_na_with_mean <- function(r) {
   vals <- values(r)
   na_mean <- mean(vals, na.rm = TRUE)
   vals[is.na(vals)] <- na_mean
@@ -59,7 +59,7 @@ if (nrow(presence_data_clean) == 0) {
 }
 
 # Define minimum distance in kilometers
-min_dist_km <- 10  # Example: 4 km
+min_dist_km <- 15  # Example: 10 km
 
 # Apply the custom thinning function
 presence_data_thinned_sf <- thin_points_sf(presence_data_clean, min_dist_km)
@@ -78,23 +78,59 @@ ggplot(presence_data_thinned, aes(x = longitude, y = latitude)) +
 # Convert to sf object
 presence_data_sf <- st_as_sf(presence_data_thinned, coords = c("longitude", "latitude"), crs = 4326)
 
-# Load the DEM raster as the template
-raster_directory <- "F:\\Modeling\\Stinknet_Updated_RF\\Rasters_ReSam"
-dem_file <- file.path(raster_directory, "DEM.tif")
-template_raster <- rast(dem_file)
+
+# Load the template raster (Min_Temp)
+template_raster <- rast("F:/Modeling/Stinknet_Updated_RF/AZ_Rasters/Min_Temp.tif")
+cat("Template raster loaded with resolution:", res(template_raster), "\n")
+
+# Set target CRS
+target_crs <- "EPSG:4326"  # WGS 1984
 
 # Load other rasters
+raster_directory <- "F:/Modeling/Stinknet_Updated_RF/AZ_Rasters"
 raster_files <- list.files(path = raster_directory, pattern = "\\.tif$", full.names = TRUE)
-raster_files <- raster_files[!grepl("DEM.tif", raster_files)]
-aligned_rasters <- list(DEM = template_raster)
+aligned_rasters <- list()
 
+# Process each raster file
 for (file in raster_files) {
+  cat("Processing", file, "\n")
   r <- rast(file)
   
-  # Check and fix extent, resolution, and coordinate system
-  if (!compareGeom(r, template_raster, stopOnError = FALSE)) {
-    r <- project(r, template_raster)
-    r <- resample(r, template_raster, method = "bilinear")
+  # Check if the raster is read correctly
+  if (is.null(r)) {
+    cat("Failed to load", file, "\n")
+    next
+  }
+  
+  # Check for non-NA values in the original raster
+  original_values <- values(r)
+  if (all(is.na(original_values))) {
+    cat("All values are NA in the original raster", file, "\n")
+    next
+  }
+  
+  # Project to WGS 1984 if necessary
+  if (crs(r) != target_crs) {
+    cat("Projecting", file, "to WGS 1984\n")
+    r <- project(r, target_crs)
+  }
+  
+  # Resample to match the template raster
+  cat("Resampling", file, "to match template raster\n")
+  r <- resample(r, template_raster, method = "bilinear")
+  
+  # Check new resolution
+  new_res <- res(r)
+  cat("New resolution of", file, ":", new_res, "\n")
+  
+  # Impute NA values with mean for continuous rasters
+  r <- impute_na_with_mean(r)
+  
+  # Check for non-NA values in the resampled raster
+  resampled_values <- values(r)
+  if (all(is.na(resampled_values))) {
+    cat("All values are NA in the resampled raster", file, "\n")
+    next
   }
   
   raster_name <- tools::file_path_sans_ext(basename(file))
@@ -103,6 +139,10 @@ for (file in raster_files) {
 
 # Combine aligned rasters into a stack
 raster_stack <- rast(aligned_rasters)
+
+# Check if the stack was created successfully
+summary(raster_stack)
+
 # Extract raster values for presence data
 presence_values <- terra::extract(raster_stack, presence_data_thinned_sf)
 presence_values <- presence_values[, -1]
@@ -110,10 +150,9 @@ presence_df <- as.data.table(presence_data_thinned_sf)
 presence_df <- cbind(presence_df, presence_values)
 presence_df$response <- 1
 
-
 # Generate background data
 set.seed(17172)
-background_points <- spatSample(raster_stack, size = nrow(presence_data_thinned) * 10, xy = TRUE, as.df = TRUE)  # Generate more background points initially
+background_points <- spatSample(raster_stack, size = nrow(presence_data_thinned), xy = TRUE, as.df = TRUE)
 background_sf <- st_as_sf(background_points, coords = c("x", "y"), crs = 4326)
 background_values <- terra::extract(raster_stack, background_sf)
 background_values <- background_values[, -1]
@@ -153,24 +192,17 @@ cat("\n")
 response_var <- "response"
 predictors <- setdiff(names(combined_data_clean), response_var)
 
-# Define response and predictors
-response_var <- "response"
-predictors <- setdiff(names(combined_data_clean), response_var)
+# Set up cross-validation control
+control <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
 
-# Set the number of trees and mtry values for tuning
-ntree_values <- seq(500, 1500, by = 250)  # Corrected syntax
-mtry_values <- seq(2, min(10, length(predictors)), by = 2)
-
-# Create a tuning grid
-tune_grid <- expand.grid(mtry = mtry_values)
+# Define the grid of hyperparameters to search
+tune_grid <- expand.grid(mtry = seq(2, min(6, length(predictors)), by = 1))
 
 # Initialize results storage
 results <- data.frame(ntree = integer(), mtry = integer(), ROC = numeric())
 
-# Set up cross-validation control
-control <- trainControl(method = "cv", number = 10, classProbs = TRUE, summaryFunction = twoClassSummary)
-
 # Loop over ntree values and train the model for each value
+ntree_values <- seq(200, 1200, by = 100)
 for (ntree in ntree_values) {
   rf_model_cv <- train(
     response ~ .,
@@ -179,7 +211,8 @@ for (ntree in ntree_values) {
     trControl = control,
     tuneGrid = tune_grid,
     metric = "ROC",
-    ntree = ntree
+    ntree = ntree,
+    importance = TRUE
   )
   
   # Extract cross-validated AUC
@@ -204,19 +237,18 @@ final_rf_model <- randomForest(
   response ~ .,
   data = combined_data_clean,
   ntree = best_ntree,
-  mtry = best_mtry
+  mtry = best_mtry,
+  nodesize = 4,  # Adjust nodesize to control tree depth
+  maxnodes = 20  # Adjust maxnodes to control tree size
 )
 
-# Ensure predictor names in the raster stack match the model
-raster_names <- names(raster_stack)
-model_vars <- predictors
+# Evaluate the model using OOB error
+print(final_rf_model)
 
-if (!all(model_vars %in% raster_names)) {
-  stop("Mismatch between model variables and raster stack names.")
-}
-
+# Check variable importance to identify redundant features
+varImpPlot(final_rf_model)
 # Create a unique filename for the prediction output
-output_filename <- paste0("F:\\Modeling\\Stinknet_Updated_RF\\RF_Models\\Model_", Sys.Date(), ".tif")
+output_filename <- paste0("F:\\Modeling\\Stinknet_Updated_RF\\RF_Models\\Model_5", Sys.Date(), ".tif")
 
 # Predict raster using the trained model
 predictions <- tryCatch({
@@ -237,6 +269,7 @@ if (!is.null(predictions)) {
 predict_function <- function(object, newdata) {
   predict(object, newdata, type = "prob")[, 2]
 }
+
 # Calculate permutation importance with AUC as the metric
 perm_importance <- vip::vi(
   object = rf_model_cv$finalModel,
@@ -269,6 +302,7 @@ for (var in predictors) {
   cat("Press Enter to continue to the next plot...")
   readline()
 }
+
 
 # Plot ROC curve for each fold
 for (fold in folds) {
